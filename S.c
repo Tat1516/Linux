@@ -2,67 +2,96 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
+#include <pthread.h>
 
-#define PORT 9734
+#define MAXCLIENT 3
+#define MAX_BITS 100
 
-// Function to calculate Hamming(7,4) code
-void hamming_encode(char data[5], char code[8]) {
-    int d[4], p[3], c[7];
+void compute_crc(char *bitstream, char *divisor, char *crc_result) {
+    int len_bitstream = strlen(bitstream);
+    int len_divisor = strlen(divisor);
 
-    for (int i = 0; i < 4; i++) {
-        d[i] = data[i] - '0';
+    // Append zeros (divisor length - 1)
+    char padded[MAX_BITS];
+    strcpy(padded, bitstream);
+    for (int i = 0; i < len_divisor - 1; i++) {
+        strcat(padded, "0");
     }
 
-    // Parity bits
-    p[0] = d[0] ^ d[1] ^ d[3]; // p1
-    p[1] = d[0] ^ d[2] ^ d[3]; // p2
-    p[2] = d[1] ^ d[2] ^ d[3]; // p4
-
-    // Place bits: p1 p2 d0 p4 d1 d2 d3
-    c[0] = p[0];
-    c[1] = p[1];
-    c[2] = d[0];
-    c[3] = p[2];
-    c[4] = d[1];
-    c[5] = d[2];
-    c[6] = d[3];
-
-    for (int i = 0; i < 7; i++) {
-        code[i] = c[i] + '0';
+    // Perform division (XOR)
+    for (int i = 0; i <= strlen(padded) - len_divisor; ) {
+        if (padded[i] == '1') {
+            for (int j = 0; j < len_divisor; j++) {
+                padded[i + j] = (padded[i + j] == divisor[j]) ? '0' : '1';
+            }
+        } else {
+            i++;
+        }
     }
-    code[7] = '\0';
+
+    // Extract CRC (last 'len_divisor - 1' bits)
+    strncpy(crc_result, padded + len_bitstream, len_divisor - 1);
+    crc_result[len_divisor - 1] = '\0';
+}
+
+void *serve(void *arg) {
+    int sockfd = *(int *)arg;
+    char bitstream[MAX_BITS];
+    char divisor[MAX_BITS];
+    char crc_result[MAX_BITS];
+    char codeword[MAX_BITS * 2];
+    struct sockaddr_in client_address;
+    socklen_t client_len = sizeof(client_address);
+
+    // Receive bitstream and divisor from client
+    recvfrom(sockfd, bitstream, MAX_BITS, 0, (struct sockaddr*)&client_address, &client_len);
+    recvfrom(sockfd, divisor, MAX_BITS, 0, (struct sockaddr*)&client_address, &client_len);
+
+    printf("Received bitstream: %s\n", bitstream);
+    printf("Received divisor: %s\n", divisor);
+
+    // Compute CRC
+    compute_crc(bitstream, divisor, crc_result);
+
+    // Construct codeword (original data + CRC)
+    strcpy(codeword, bitstream);
+    strcat(codeword, crc_result);
+
+    printf("Computed CRC: %s\n", crc_result);
+    printf("Final codeword: %s\n", codeword);
+
+    // Send back the full codeword (data + CRC)
+    sendto(sockfd, codeword, strlen(codeword) + 1, 0, (struct sockaddr*)&client_address, client_len);
+
+    return NULL;
 }
 
 int main() {
-    int server_sockfd, client_sockfd;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t client_len;
-    char data[5], code[8];
+    int sockfd;
+    struct sockaddr_in server_address;
+    pthread_t th[MAXCLIENT];
 
-    server_sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(PORT);
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    server_address.sin_family = AF_INET;
+    server_address.sin_addr.s_addr = inet_addr("127.0.0.1");
+    server_address.sin_port = htons(9734);
 
-    bind(server_sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr));
-    listen(server_sockfd, 5);
-    printf("Server started. Waiting for client...\n");
+    bind(sockfd, (struct sockaddr*)&server_address, sizeof(server_address));
 
-    while (1) {
-        client_len = sizeof(client_addr);
-        client_sockfd = accept(server_sockfd, (struct sockaddr *)&client_addr, &client_len);
+    printf("CRC Server started (UDP). Listening on port 9734...\n");
 
-        read(client_sockfd, data, sizeof(data));
-        printf("Received data from client: %s\n", data);
-
-        hamming_encode(data, code);
-        printf("Sending Hamming codeword: %s\n", code);
-
-        write(client_sockfd, code, strlen(code) + 1);
-        close(client_sockfd);
+    for (int i = 0; i < MAXCLIENT; i++) {
+        pthread_create(&th[i], NULL, serve, &sockfd);
     }
 
-    close(server_sockfd);
+    for (int i = 0; i < MAXCLIENT; i++) {
+        pthread_join(th[i], NULL);
+    }
+
+    close(sockfd);
     return 0;
 }
