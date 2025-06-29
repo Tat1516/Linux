@@ -1,112 +1,108 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <arpa/inet.h>
+#include <stdio.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
 
-#define PORT 8080
-#define MAX_DATA_SIZE 4  // 4-bit dataword
-
-/********************************* Hamming Code Functions ********************************/
-void calculateHammingCode(int data[], int hammingCode[7]) {
-    /* Data bits positions (0-based index):
-       2 (d1), 4 (d2), 5 (d3), 6 (d4) */
-    hammingCode[2] = data[0];  // d1
-    hammingCode[4] = data[1];  // d2
-    hammingCode[5] = data[2];  // d3
-    hammingCode[6] = data[3];  // d4
-
-    /* Calculate parity bits:
-       p1 (pos 0) covers bits 0,2,4,6
-       p2 (pos 1) covers bits 1,2,5,6
-       p3 (pos 3) covers bits 3,4,5,6 */
-    hammingCode[0] = hammingCode[2] ^ hammingCode[4] ^ hammingCode[6];
-    hammingCode[1] = hammingCode[2] ^ hammingCode[5] ^ hammingCode[6];
-    hammingCode[3] = hammingCode[4] ^ hammingCode[5] ^ hammingCode[6];
-}
-
-/************************************ Main Server Code ***********************************/
 int main() {
     int sockfd;
-    struct sockaddr_in servaddr, cliaddr;
+    socklen_t client_len;
+    struct sockaddr_in server_addr, client_addr;
+    int stream[200], stuffed[400];
     
     // Create UDP socket
-    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-        perror("socket creation failed");
-        exit(EXIT_FAILURE);
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if(sockfd == -1) {
+        perror("Socket error");
+        exit(1);
     }
-
-    memset(&servaddr, 0, sizeof(servaddr));
-    memset(&cliaddr, 0, sizeof(cliaddr));
 
     // Configure server address
-    servaddr.sin_family = AF_INET;
-    servaddr.sin_addr.s_addr = INADDR_ANY;
-    servaddr.sin_port = htons(PORT);
-
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    server_addr.sin_port = htons(9734);
+    
     // Bind socket
-    if (bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
-        perror("bind failed");
+    if(bind(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
+        perror("Bind error");
         close(sockfd);
-        exit(EXIT_FAILURE);
+        exit(1);
     }
 
-    printf("Server ready on port %d...\n", PORT);
+    printf("UDP Server ready\n");
 
-    while(1) {  // Continuous operation
-        int dataSize;
-        socklen_t len = sizeof(cliaddr);
+    while(1) {
+        printf("\nServer Waiting\n");
+        client_len = sizeof(client_addr);
+
+        // Receive data length
+        int original_len;
+        if(recvfrom(sockfd, &original_len, sizeof(int), 0, (struct sockaddr*)&client_addr, &client_len) <= 0) {
+            perror("Length receive error");
+            continue;
+        }
+
+        // Validate input length
+        if(original_len <= 0 || original_len > 200) {
+            printf("Invalid length: %d\n", original_len);
+            continue;
+        }
+
+        // Receive data stream
+        for(int i = 0; i < original_len; i++) {
+            if(recvfrom(sockfd, &stream[i], sizeof(int), 0, (struct sockaddr*)&client_addr, &client_len) <= 0) {
+                perror("Data receive error");
+                continue;
+            }
+        }
+
+        // Bit stuffing logic
+        int new_len = 0;
+        int tracking = 0;
+        int one_count = 0;
         
-        // Receive data size
-        ssize_t recv_len = recvfrom(sockfd, &dataSize, sizeof(int), 0,
-                                   (struct sockaddr *)&cliaddr, &len);
-        if(recv_len < 0) {
-            perror("size receive error");
+        for(int i = 0; i < original_len; i++) {
+            stuffed[new_len++] = stream[i];
+            
+            if(tracking) {
+                if(stream[i] == 1) {
+                    one_count++;
+                    if(one_count == 5) {
+                        stuffed[new_len++] = 0;
+                        tracking = 0;
+                        one_count = 0;
+                    }
+                } else {
+                    tracking = (stream[i] == 0) ? 1 : 0;
+                    one_count = 0;
+                }
+            } else {
+                if(stream[i] == 0) {
+                    tracking = 1;
+                    one_count = 0;
+                }
+            }
+        }
+
+        // Send back stuffed data
+        if(sendto(sockfd, &new_len, sizeof(int), 0, (struct sockaddr*)&client_addr, client_len) == -1) {
+            perror("Length send error");
             continue;
         }
-
-        // Validate data size
-        if(dataSize != MAX_DATA_SIZE) {
-            fprintf(stderr, "Invalid data size: %d\n", dataSize);
-            continue;
+        
+        for(int i = 0; i < new_len; i++) {
+            if(sendto(sockfd, &stuffed[i], sizeof(int), 0, (struct sockaddr*)&client_addr, client_len) == -1) {
+                perror("Data send error");
+                break;
+            }
         }
 
-        int receivedData[MAX_DATA_SIZE];
-        recv_len = recvfrom(sockfd, receivedData, MAX_DATA_SIZE * sizeof(int), 0,
-                          (struct sockaddr *)&cliaddr, &len);
-        if(recv_len < 0) {
-            perror("data receive error");
-            continue;
-        }
-
-        printf("Received dataword: ");
-        for(int i=0; i<MAX_DATA_SIZE; i++) {
-            printf("%d ", receivedData[i]);
-        }
-        printf("\n");
-
-        // Calculate Hamming code
-        int hammingCode[7] = {0};
-        calculateHammingCode(receivedData, hammingCode);
-
-        // Send response
-        const int codeSize = 7;
-        sendto(sockfd, &codeSize, sizeof(int), 0,
-              (const struct sockaddr *)&cliaddr, len);
-        sendto(sockfd, hammingCode, codeSize * sizeof(int), 0,
-              (const struct sockaddr *)&cliaddr, len);
-
-        printf("Sent codeword: ");
-        for(int i=0; i<codeSize; i++) {
-            printf("%d ", hammingCode[i]);
-        }
-        printf("\n\n");
+        printf("Processed %d → %d bits\n", original_len, new_len);
     }
 
     close(sockfd);
     return 0;
 }
-
